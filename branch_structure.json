@@ -1,0 +1,18 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "fix/issue-191-corridor-plan-claims-sep-38-quote-and-verified",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "fix/issue-191-corridor-plan-claims-sep-38-quote-and-verified": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "fix/issue-191-corridor-plan-claims-sep-38-quote-and-verified",
+    "origin"
+  ]
+}
