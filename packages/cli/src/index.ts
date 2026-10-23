@@ -23,7 +23,7 @@
 
 import { loadCorridor } from "@corridor/manifest";
 import { isSettleableAmount } from "@corridor/types";
-import { PostgresIdempotencyStore, migrate, type CorridorHealthStore } from "@corridor/engine";
+import { PostgresSqlIdempotencyStore, migrate, type CorridorHealthStore } from "@corridor/engine";
 import { newCommand } from "./new.js";
 import {
   RESOLVE_USAGE,
@@ -68,7 +68,7 @@ async function main(argv: string[]): Promise<number> {
   const [cmd] = argv;
   if (cmd === "runs") {
     const parsed = parseListArgs(argv.slice(1));
-    return parsed ? withStore((store) => listHeldRuns(store, parsed)) : 2;
+    return parsed ? withNStore((store) => listHeldRuns(store, parsed)) : 2;
   }
   if (cmd === "resolve") return resolveCommand(argv.slice(1));
   if (cmd === "breaker") return breakerCommand(argv.slice(1));
@@ -118,7 +118,8 @@ async function main(argv: string[]): Promise<number> {
         if (!file) {
           file = arg;
         } else {
-          console.error(`error: unexpected argument "${arg}"`);
+          console.error(`error: unexpected argument "${
+            arg}"`);
           return 2;
         }
       }
@@ -320,7 +321,7 @@ async function resolveCommand(args: string[]): Promise<number> {
   return withStore((store) => resolveHeldRun(store, parsed, resolvedBy));
 }
 
-async function withStore(
+async function withNStore(
   fn: (store: PostgresIdempotencyStore) => Promise<number>,
 ): Promise<number> {
   const opened = await openStore();

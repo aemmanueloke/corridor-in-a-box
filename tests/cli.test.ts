@@ -256,6 +256,17 @@ describe("corridor CLI", () => {
     expect(r.stdout).toContain("2026-10-17");
   });
 
+  it("plan: does not claim SEP-38 or all five steps for an external-quote corridor", () => {
+    const r = run(["plan", "corridors/ng-cowrie.corridor.yaml"]);
+    expect(r.status).toBe(0);
+    // The lane has quote_source: external and no quote_server, so the plan must
+    // not advertise a SEP-38 endpoint or certify every step.
+    expect(r.stdout).not.toContain("SEP-38");
+    expect(r.stdout).not.toContain("all five steps");
+    // The quote line must say the quote is operator-supplied and unverified.
+    expect(r.stdout).toContain("external");
+  });
+
   it("plan: prints SEP-6 steps for a sep6 corridor and never SEP-31", () => {
     const r = run(["plan", "corridors/testanchor-sep6.corridor.yaml"]);
     expect(r.status).toBe(0);
