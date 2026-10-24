@@ -260,11 +260,20 @@ describe("corridor CLI", () => {
     const r = run(["plan", "corridors/ng-cowrie.corridor.yaml"]);
     expect(r.status).toBe(0);
     // The lane has quote_source: external and no quote_server, so the plan must
-    // not advertise a SEP-38 endpoint or certify every step.
-    expect(r.stdout).not.toContain("SEP-38");
+    // not advertise a SEP-38 endpoint or certify every step. The operator's own
+    // status_note says "No SEP-38", so only the generated lines are checked.
+    const generated = r.stdout
+      .split("\n")
+      .filter((l) => !l.startsWith("note:"))
+      .join("\n");
+    expect(generated).not.toContain("SEP-38");
     expect(r.stdout).not.toContain("all five steps");
     // The quote line must say the quote is operator-supplied and unverified.
-    expect(r.stdout).toContain("external");
+    expect(r.stdout).toMatch(
+      /1\. quote\s+external\s+operator-supplied rate \(not verified by this tool\)/,
+    );
+    expect(r.stdout).toContain("liveness: ✓ VERIFIED — dest endpoints confirmed 2026-10-17");
+    expect(r.stdout).toContain("not covered by endpoints_verified_at — 1. quote (external)");
   });
 
   it("plan: prints SEP-6 steps for a sep6 corridor and never SEP-31", () => {

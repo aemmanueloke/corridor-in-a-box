@@ -41,6 +41,7 @@ import {
   type DepositInstructionsKind,
   type GateCheck,
   type GateContext,
+  needsPathPayment,
   type RefundRequest,
   type SettlementRef,
   settlementId,
@@ -150,7 +151,20 @@ type HorizonServerLike = Pick<
   Horizon.Server,
   "loadAccount" | "submitTransaction" | "transactions"
 > &
-  Partial<Pick<Horizon.Server, "payments">>;
+  Partial<Pick<Horizon.Server, "payments" | "strictSendPaths">>;
+
+/** The fields of a Horizon strict-send path record this package reads. */
+interface StrictSendPathRecord {
+  readonly destination_amount: string;
+  readonly path: ReadonlyArray<{
+    readonly asset_type: string;
+    readonly asset_code?: string;
+    readonly asset_issuer?: string;
+  }>;
+}
+
+/** Slippage tolerated on a path payment when the manifest names none: 0.5%. */
+export const DEFAULT_MAX_SLIPPAGE_BPS = 50;
 
 export interface StellarSubmitterOptions {
   /** Production: a KMS/HSM-backed signer that never exposes the seed. */
@@ -170,6 +184,49 @@ export interface StellarSubmitterOptions {
   /** Injectable clock/sleep for tests. */
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Networks this submitter may settle on. **Default `["testnet"]`** — moving
+   * real money has to be a decision, not a manifest typo. A corridor whose
+   * `settlement.network` is not listed is refused before the account is loaded
+   * and before anything is signed.
+   *
+   * Set `["testnet", "public"]` (or `["public"]`) deliberately: this is the
+   * guard that used to live only in the example launchers, which an embedder
+   * using the library directly never inherited.
+   */
+  allowedNetworks?: readonly StellarNetwork[];
+  /**
+   * Permit a `LocalKeypairSigner` (an in-process seed, including one built from
+   * `signerSecret`) to sign on the public network. Default `false`: per
+   * docs/key-management.md the mainnet seed belongs in a KMS/HSM, so a dev key
+   * must not be able to move mainnet funds even after `allowedNetworks` says the
+   * network is fine.
+   */
+  allowLocalSignerOnMainnet?: boolean;
+  /**
+   * Test seam for the Horizon-root check (see `allowedNetworks`). Called once,
+   * lazily, to read the endpoint's `network_passphrase`.
+   *
+   * Defaults to a real fetch against `horizonUrl` — and is skipped entirely when
+   * `horizonServer` is injected without one, because a fake server means the URL
+   * is not the transport actually talking to.
+   */
+  fetchHorizonRoot?: (url: string) => Promise<HorizonRoot>;
+}
+
+/** The networks a corridor manifest can name, and a submitter can be allowed on. */
+export type StellarNetwork = "public" | "testnet";
+
+/** The part of Horizon's root resource this package reads. */
+export interface HorizonRoot {
+  readonly network_passphrase?: string;
+}
+
+/** Read the root resource of a real Horizon endpoint over HTTP. */
+async function defaultFetchHorizonRoot(url: string): Promise<HorizonRoot> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as HorizonRoot;
 }
 
 class AsyncLock {
@@ -283,6 +340,13 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
    *  confirm() poll, so one ambiguous submission doesn't head-of-line-block
    *  every other in-flight payment from this signer. */
   private readonly lock = new AsyncLock();
+  private readonly allowedNetworks: readonly StellarNetwork[];
+  private readonly allowLocalSignerOnMainnet: boolean;
+  private readonly horizonUrl: string;
+  /** Undefined when the endpoint's declared network cannot be read (fake server). */
+  private readonly rootFetcher?: (url: string) => Promise<HorizonRoot>;
+  /** Memoised `network_passphrase` of the endpoint — the root is read once. */
+  private rootPassphrase?: string;
 
   constructor(opts: StellarSubmitterOptions) {
     if (!opts.signer && !opts.signerSecret) {
@@ -306,26 +370,261 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
       );
     }
     this.fee = fee;
+    this.allowedNetworks = opts.allowedNetworks ?? ["testnet"];
+    this.allowLocalSignerOnMainnet = opts.allowLocalSignerOnMainnet ?? false;
+    this.horizonUrl = opts.horizonUrl;
+    this.rootFetcher =
+      opts.fetchHorizonRoot ?? (opts.horizonServer ? undefined : defaultFetchHorizonRoot);
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
     return this.lock.withLock(fn);
   }
 
+  /**
+   * Fail closed before a signature is produced when this submitter is not
+   * allowed to move money on the corridor's network. Three independent checks,
+   * because they stop three different accidents:
+   *
+   * 1. `allowedNetworks` — the "I did not mean to run on mainnet" typo. This is
+   *    opt-in by design: the default is testnet-only, so an embedder has to ask
+   *    for real money.
+   * 2. the signer kind — a seed sitting in the process belongs to a throwaway
+   *    testnet key (docs/key-management.md), so mainnet needs both the network
+   *    opt-in AND an explicit ack that a dev key is acceptable here.
+   * 3. the endpoint's own `network_passphrase` — a testnet manifest pointed at a
+   *    mainnet Horizon (or the reverse) would otherwise sign a transaction whose
+   *    hash is meaningless to the network it lands on.
+   *
+   * Everything here runs before `loadAccount`, so a refusal costs no sequence
+   * number, no signature and no transaction.
+   */
+  private async guardNetwork(network: StellarNetwork): Promise<Outcome<void>> {
+    if (!this.allowedNetworks.includes(network)) {
+      return fail(
+        "SETTLEMENT_FAILED",
+        `refusing to settle on network "${network}": this submitter allows ` +
+          `[${this.allowedNetworks.join(", ")}]. Settling real money is opt-in — pass ` +
+          `allowedNetworks: ["testnet", "public"] only if you mean it.`,
+        { retryable: false },
+      );
+    }
+    if (network === "public" && this.signer instanceof LocalKeypairSigner) {
+      if (!this.allowLocalSignerOnMainnet) {
+        return fail(
+          "SETTLEMENT_FAILED",
+          `refusing to sign a public-network settlement with a LocalKeypairSigner: the seed ` +
+            `would live in this process. Use a KMS/HSM-backed ExternalSigner (see ` +
+            `docs/key-management.md), or pass allowLocalSignerOnMainnet: true deliberately.`,
+          { retryable: false },
+        );
+      }
+    }
+    if (!this.rootFetcher) return ok(undefined);
+
+    if (this.rootPassphrase === undefined) {
+      let root: HorizonRoot;
+      try {
+        root = await this.rootFetcher(this.horizonUrl);
+      } catch (cause) {
+        // Nothing was built, signed or submitted, so a retry is safe — but the
+        // run must not proceed on an endpoint we could not place.
+        return fail(
+          "SETTLEMENT_FAILED",
+          `cannot verify the network of Horizon ${this.horizonUrl} ` +
+            `(root resource unreadable: ${describe(cause)}); refusing to sign`,
+          { retryable: true, cause },
+        );
+      }
+      this.rootPassphrase = root.network_passphrase ?? "";
+    }
+    const expected = passphraseFor(network);
+    if (this.rootPassphrase !== expected) {
+      return fail(
+        "SETTLEMENT_FAILED",
+        `Horizon ${this.horizonUrl} serves "${this.rootPassphrase || "unknown"}" but this ` +
+          `corridor settles on "${expected}" (${network}); refusing to sign a ` +
+          `transaction for the wrong network`,
+        { retryable: false },
+      );
+    }
+    return ok(undefined);
+  }
+
   async submit(req: SettlementRequest): Promise<Outcome<SettlementRef>> {
+    const pre = await this.preflight(req);
+    if (!pre.ok) return pre;
+    // A plain payment delivers the bridge asset; an anchor that receives another
+    // asset would get the wrong one. Route those through StellarPathPaymentStrategy.
+    if (needsPathPayment(req.corridor)) {
+      return fail(
+        "SETTLEMENT_FAILED",
+        `corridor ${req.corridor.id} settles in receive_asset ` +
+          `${req.corridor.settlement.receive_asset}, not bridge asset ` +
+          `${req.corridor.settlement.bridge_asset}; refusing a plain payment ` +
+          `(use StellarPathPaymentStrategy)`,
+        { retryable: false },
+      );
+    }
+    return this.send(req, () =>
+      Operation.payment({
+        destination: req.to,
+        asset: bridgeAsset(req.amount.asset, req.corridor.settlement.asset_issuer),
+        amount: req.amount.amount,
+      }),
+    );
+  }
+
+  /**
+   * Settle `req` as one `path_payment_strict_send`: exactly `req.amount` of the
+   * bridge asset goes out, and at least `destMin` of the corridor's
+   * `receive_asset` must arrive or the operation fails on-chain.
+   *
+   * `destMin` is the best strict-send path Horizon quotes for this exact send
+   * amount, less `settlement.max_slippage_bps` (default 50). Fails closed —
+   * nothing signed or submitted — when there is no path, or when `destMin`
+   * would undercut `req.minDestAmount` (what the anchor said it must receive).
+   * Signing, the per-signer lock, confirmation and ambiguous-submit handling
+   * are the same as `submit()`'s.
+   */
+  async submitPathPayment(req: PathPaymentSettlementRequest): Promise<Outcome<SettlementRef>> {
+    const pre = await this.preflight(req);
+    if (!pre.ok) return pre;
+
+    const { settlement } = req.corridor;
+    let sendAsset: Asset;
+    let destAsset: Asset;
+    try {
+      sendAsset = bridgeAsset(req.amount.asset, settlement.asset_issuer);
+      destAsset = bridgeAsset(
+        settlement.receive_asset ?? settlement.bridge_asset,
+        settlement.receive_asset_issuer ?? settlement.asset_issuer,
+      );
+    } catch (cause) {
+      return fail("SETTLEMENT_FAILED", `invalid path-payment asset: ${describe(cause)}`, {
+        retryable: false,
+        cause,
+      });
+    }
+
+    const route = await this.bestStrictSendPath(sendAsset, req.amount.amount, destAsset);
+    if (!route.ok) return route;
+    const bps = settlement.max_slippage_bps ?? DEFAULT_MAX_SLIPPAGE_BPS;
+    const destMin = applySlippage(route.value.destinationAmount, bps);
+    if (!destMin.ok) return destMin;
+    if (req.minDestAmount !== undefined) {
+      const cmp = compareAmounts(destMin.value, req.minDestAmount);
+      if (!cmp.ok || cmp.value < 0) {
+        return fail(
+          "SETTLEMENT_FAILED",
+          `path payment destMin ${destMin.value} ${assetLabel(destAsset)} (best path ` +
+            `${route.value.destinationAmount} less ${bps} bps) is below the ` +
+            `${req.minDestAmount} the anchor requires; refusing to submit`,
+          { retryable: false },
+        );
+      }
+    }
+
+    return this.send(req, () =>
+      Operation.pathPaymentStrictSend({
+        sendAsset,
+        sendAmount: req.amount.amount,
+        destination: req.to,
+        destAsset,
+        destMin: destMin.value,
+        path: route.value.path,
+      }),
+    );
+  }
+
+  /** Refuse before anything is built: wrong network/signer, or a quote already dead. */
+  private async preflight(req: SettlementRequest): Promise<Outcome<void>> {
+    const guarded = await this.guardNetwork(req.corridor.settlement.network);
+    if (!guarded.ok) return guarded;
+
     const now = this.now();
     if (req.validUntil !== undefined && req.validUntil <= now) {
       return fail("QUOTE_EXPIRED", `quote expired at ${req.validUntil} (now=${now})`, {
         retryable: false,
       });
     }
+    return ok(undefined);
+  }
 
+  /**
+   * Ask Horizon for strict-send paths and keep the one delivering the most.
+   * Read-only: a failed query is safe to retry, an empty answer is not going
+   * to fix itself within this quote.
+   */
+  private async bestStrictSendPath(
+    sendAsset: Asset,
+    sendAmount: string,
+    destAsset: Asset,
+  ): Promise<Outcome<{ destinationAmount: string; path: Asset[] }>> {
+    if (!this.server.strictSendPaths) {
+      return fail("SETTLEMENT_FAILED", "Horizon server does not expose strictSendPaths", {
+        retryable: false,
+      });
+    }
+    let records: readonly StrictSendPathRecord[];
+    try {
+      records = (await this.server.strictSendPaths(sendAsset, sendAmount, [destAsset]).call())
+        .records;
+    } catch (cause) {
+      return fail("SETTLEMENT_FAILED", `strict-send path query failed: ${describe(cause)}`, {
+        retryable: true,
+        cause,
+      });
+    }
+    // Horizon answers in 7-decimal strings; compare as stroops, never floats.
+    let best: { record: StrictSendPathRecord; amount: bigint } | undefined;
+    for (const r of records) {
+      const amount = toScaled(r.destination_amount, STROOP_SCALE);
+      if (!amount.ok || amount.value <= 0n) continue;
+      if (best === undefined || amount.value > best.amount) {
+        best = { record: r, amount: amount.value };
+      }
+    }
+    if (best === undefined) {
+      return fail(
+        "SETTLEMENT_FAILED",
+        `no strict-send path from ${sendAmount} ${assetLabel(sendAsset)} to ` +
+          `${assetLabel(destAsset)}; refusing to submit`,
+        { retryable: false },
+      );
+    }
+    try {
+      return ok({
+        destinationAmount: fromScaled(best.amount, STROOP_SCALE),
+        path: best.record.path.map((a) =>
+          a.asset_type === "native"
+            ? Asset.native()
+            : new Asset(a.asset_code ?? "", a.asset_issuer ?? ""),
+        ),
+      });
+    } catch (cause) {
+      return fail("SETTLEMENT_FAILED", `unusable path from Horizon: ${describe(cause)}`, {
+        retryable: false,
+        cause,
+      });
+    }
+  }
+
+  /**
+   * Build → sign → submit one operation under the per-signer lock, then confirm
+   * it on Horizon. Shared by every settle shape so the ambiguous-submit rule
+   * (never resubmit blind; look the hash up first) lives in exactly one place.
+   */
+  private async send(
+    req: SettlementRequest,
+    operation: () => xdr.Operation,
+  ): Promise<Outcome<SettlementRef>> {
     let hash: string | undefined;
     let submitAttempted = false;
     try {
       const { network } = req.corridor.settlement;
       const passphrase = passphraseFor(network);
-      const asset = bridgeAsset(req.amount.asset, req.corridor.settlement.asset_issuer);
+      const op = operation();
 
       await this.withLock(async () => {
         const source = await this.server.loadAccount(this.signer.publicKey);
@@ -343,9 +642,7 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
           fee: feeStroops,
           networkPassphrase: passphrase,
         })
-          .addOperation(
-            Operation.payment({ destination: req.to, asset, amount: req.amount.amount }),
-          )
+          .addOperation(op)
           // Beat the firm-quote expiry: the tx must hit the ledger before the quote dies.
           .setTimebounds(0, maxTime);
 
@@ -485,6 +782,55 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
       now: this.now,
       sleep: this.sleep,
       confirmTimeoutMs: this.confirmTimeoutMs,
+    });
+  }
+}
+
+/** A settlement paid as a path payment by `StellarSettlementSubmitter.submitPathPayment`. */
+export interface PathPaymentSettlementRequest extends SettlementRequest {
+  /** The least `receive_asset` the anchor will accept, as a decimal string. A
+   *  `destMin` below it fails closed before anything is signed. */
+  readonly minDestAmount?: string;
+}
+
+/**
+ * `stellar_payment` settlement for a corridor whose anchor receives a different
+ * asset than the bridge asset (`settlement.receive_asset`): one
+ * `path_payment_strict_send` through the DEX, built and submitted by the given
+ * StellarSettlementSubmitter. Pass that same submitter as `EngineDeps.submitter`
+ * so plain and path settlements share one sequence-number lock.
+ *
+ * `matches()` claims only corridors that need a path, and the default
+ * StellarPaymentStrategy declines exactly those, so the two sit side by side in
+ * `EngineDeps.strategies` in either order.
+ */
+export class StellarPathPaymentStrategy implements SettlementStrategy {
+  readonly kind: DepositInstructionsKind = "stellar_payment";
+
+  constructor(private readonly submitter: StellarSettlementSubmitter) {}
+
+  matches({ corridor }: SettlementStrategyContext): boolean {
+    return needsPathPayment(corridor);
+  }
+
+  async settle({
+    opened,
+    quote,
+    corridor,
+  }: SettlementStrategyContext): Promise<Outcome<SettlementRef>> {
+    const req = buildSettlementRequest(opened, quote, corridor);
+    // What the anchor said it expects in (amount_in, carried from its firm
+    // quote) is the floor only when stated in the asset it actually receives.
+    const { receive_asset, receive_asset_issuer } = corridor.settlement;
+    const minDestAmount =
+      opened.amountIn &&
+      receive_asset !== undefined &&
+      namesAsset(opened.amountIn.asset, receive_asset, receive_asset_issuer)
+        ? opened.amountIn.amount
+        : undefined;
+    return this.submitter.submitPathPayment({
+      ...req,
+      ...(minDestAmount !== undefined && { minDestAmount }),
     });
   }
 }
@@ -693,6 +1039,37 @@ export class StellarClaimableBalanceStrategy implements SettlementStrategy {
   }
 }
 
+/** Whether a Money asset id ("USDC", "stellar:USDC:G…", "native") names `code`/`issuer`. */
+function namesAsset(id: string, code: string, issuer: string | undefined): boolean {
+  if (code.toUpperCase() === "XLM") {
+    return id.toUpperCase() === "XLM" || id === "native" || id === "stellar:native";
+  }
+  return id === code || id === `stellar:${code}:${issuer}`;
+}
+
+function assetLabel(a: Asset): string {
+  return a.isNative() ? "XLM" : `${a.getCode()}:${a.getIssuer()}`;
+}
+
+/**
+ * `expected × (1 - bps/10000)`, in stroops. Rounded UP: destMin is a floor on
+ * what must arrive, so rounding up can only tighten it (by under one stroop) and
+ * never lets through more slippage than the manifest allows.
+ */
+function applySlippage(expected: string, bps: number): Outcome<string> {
+  const scaled = toScaled(expected, STROOP_SCALE);
+  if (!scaled.ok || scaled.value <= 0n) {
+    return fail("SETTLEMENT_FAILED", `invalid expected path amount "${expected}"`, {
+      retryable: false,
+    });
+  }
+  if (!Number.isInteger(bps) || bps < 0 || bps >= 10_000) {
+    return fail("SETTLEMENT_FAILED", `invalid max_slippage_bps ${bps}`, { retryable: false });
+  }
+  const keep = BigInt(10_000 - bps);
+  return ok(fromScaled((scaled.value * keep + 9_999n) / 10_000n, STROOP_SCALE));
+}
+
 function normalizeHashMemo(m: string): string {
   if (/^[0-9a-fA-F]{64}$/.test(m)) {
     return m.toLowerCase();
@@ -795,6 +1172,11 @@ export interface SettlementOperationFacts {
   readonly asset_type?: string;
   readonly asset_code?: string;
   readonly asset_issuer?: string;
+  /** Path payments only: what left the sender (`amount`/`asset_*` is what arrived). */
+  readonly source_amount?: string;
+  readonly source_asset_type?: string;
+  readonly source_asset_code?: string;
+  readonly source_asset_issuer?: string;
 }
 
 /** What Horizon says a settlement transaction contains. */
@@ -1041,6 +1423,12 @@ export class AccountInspector {
           asset_type: o.asset_type,
           asset_code: o.asset_code,
           asset_issuer: o.asset_issuer,
+          ...(o.source_amount !== undefined && {
+            source_amount: o.source_amount,
+            source_asset_type: o.source_asset_type,
+            source_asset_code: o.source_asset_code,
+            source_asset_issuer: o.source_asset_issuer,
+          }),
         })),
       });
     } catch (err: unknown) {
@@ -1165,8 +1553,30 @@ function mismatch(
   );
 }
 
+/** A mismatch when the on-chain asset is not `code`/`issuer` ("XLM" → native). */
+function assetMismatch(
+  field: string,
+  code: string,
+  issuer: string | undefined,
+  actual: { type?: string; code?: string; issuer?: string },
+): Outcome<never> | undefined {
+  if (code.toUpperCase() === "XLM") {
+    if (actual.type === "native") return undefined;
+    return mismatch(field, "XLM (native)", `${actual.code ?? actual.type}`);
+  }
+  if (actual.type !== "native" && actual.code === code && actual.issuer === issuer) {
+    return undefined;
+  }
+  return mismatch(
+    field,
+    `${code}:${issuer}`,
+    actual.type === "native" ? "XLM (native)" : `${actual.code}:${actual.issuer}`,
+  );
+}
+
 /**
  * Assert a transaction contains exactly one operation and that it is a payment
+ * (a path_payment_strict_send for a corridor with a differing `receive_asset`)
  * matching the request's destination, amount, asset and memo. Pure: no I/O.
  */
 export function verifySettlementFacts(
@@ -1182,26 +1592,40 @@ export function verifySettlementFacts(
     return mismatch("operation count", "1", String(facts.operations.length));
   }
   const op = facts.operations[0] as SettlementOperationFacts;
-  if (op.type !== "payment") return mismatch("operation type", "payment", op.type);
+  const settlement = req.corridor.settlement;
+  const path = needsPathPayment(req.corridor);
+  const type = path ? "path_payment_strict_send" : "payment";
+  if (op.type !== type) return mismatch("operation type", type, op.type);
   if (op.to !== req.to) return mismatch("destination", req.to, op.to);
 
-  const cmp = compareAmounts(req.amount.amount, op.amount ?? "");
-  if (!cmp.ok || cmp.value !== 0) return mismatch("amount", req.amount.amount, op.amount);
+  // A path payment's `amount`/`asset_*` is what arrived (bounded on-chain by
+  // destMin); the request's amount and bridge asset are what left, `source_*`.
+  const sent = path
+    ? {
+        amount: op.source_amount,
+        type: op.source_asset_type,
+        code: op.source_asset_code,
+        issuer: op.source_asset_issuer,
+      }
+    : { amount: op.amount, type: op.asset_type, code: op.asset_code, issuer: op.asset_issuer };
+  const cmp = compareAmounts(req.amount.amount, sent.amount ?? "");
+  if (!cmp.ok || cmp.value !== 0) return mismatch("amount", req.amount.amount, sent.amount);
 
-  const code = req.corridor.settlement.bridge_asset;
-  if (code.toUpperCase() === "XLM") {
-    if (op.asset_type !== "native") {
-      return mismatch("asset", "XLM (native)", `${op.asset_code ?? op.asset_type}`);
-    }
-  } else {
-    const issuer = req.corridor.settlement.asset_issuer;
-    if (op.asset_type === "native" || op.asset_code !== code || op.asset_issuer !== issuer) {
-      return mismatch(
-        "asset",
-        `${code}:${issuer}`,
-        op.asset_type === "native" ? "XLM (native)" : `${op.asset_code}:${op.asset_issuer}`,
-      );
-    }
+  const wrongAsset = assetMismatch(
+    "asset",
+    settlement.bridge_asset,
+    settlement.asset_issuer,
+    sent,
+  );
+  if (wrongAsset) return wrongAsset;
+  if (path) {
+    const wrongReceive = assetMismatch(
+      "receive asset",
+      settlement.receive_asset as string,
+      settlement.receive_asset_issuer,
+      { type: op.asset_type, code: op.asset_code, issuer: op.asset_issuer },
+    );
+    if (wrongReceive) return wrongReceive;
   }
 
   // Memo: compare in one canonical form per type. A hash memo is base64 on both
