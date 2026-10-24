@@ -8,10 +8,12 @@
 import {
   liveness,
   protocolOf,
+  type ComplianceMethod,
   type Corridor,
   type DestProtocol,
   type Liveness,
 } from "@corridor/manifest";
+import type { RegistryNetwork } from "./plan-registry.js";
 
 /** The five engine verbs, in execution order. */
 export type PlanVerb = "quote" | "comply" | "open" | "settle" | "reconcile";
@@ -27,7 +29,7 @@ export interface PlanStep {
 }
 
 /** How customer compliance is handled for the destination leg. */
-export type ComplianceMethod = "sep12" | "sep6_fields" | "bespoke" | "none";
+export type { ComplianceMethod };
 
 export interface PlanSettlement {
   /** How the bridge asset reaches the destination anchor. */
@@ -88,6 +90,9 @@ function quoteStep(c: Corridor, protocol: DestProtocol): StepDraft {
 }
 
 function complianceMethod(c: Corridor): ComplianceMethod {
+  // An explicit manifest declaration wins; otherwise describe what the
+  // protocol's adapter will do.
+  if (c.compliance.method) return c.compliance.method;
   const endpoints = c.dest.endpoints;
   if ("kyc_server" in endpoints && endpoints.kyc_server) return "sep12";
   if (c.dest.protocol === "sep6") return "sep6_fields";
@@ -200,6 +205,20 @@ export function buildPlan(c: Corridor): Plan {
   };
 }
 
+/**
+ * Steps that `endpoints_verified_at` says nothing about: the liveness gaps (an
+ * external quote), plus a SEP-38 quote with no quote_server to have checked.
+ */
+function uncoveredSteps(c: Corridor, plan: Plan): PlanStep[] {
+  const endpoints = c.dest.endpoints;
+  const quoteServer = "quote_server" in endpoints ? endpoints.quote_server : undefined;
+  const missingQuoteServer = c.fx.quote_source === "sep38" && !quoteServer;
+  return plan.steps.filter(
+    (step) =>
+      plan.liveness.gaps.includes(step.verb) || (step.verb === "quote" && missingQuoteServer),
+  );
+}
+
 /** Render the human-readable plan, including the same liveness block as before. */
 export function formatPlan(c: Corridor, plan: Plan): string {
   const lines: string[] = [];
@@ -248,7 +267,12 @@ export function formatPlan(c: Corridor, plan: Plan): string {
       `liveness: ✓✓ PROVEN — canary ${hashPrefix} completed ${date} (${daysAgo} days ago, expires in ${expiresIn}d)`,
     );
   } else if (live.state === "verified") {
-    line(`liveness: ✓ VERIFIED — endpoints confirmed ${live.verifiedAt} for all five steps`);
+    line(`liveness: ✓ VERIFIED — dest endpoints confirmed ${live.verifiedAt}`);
+    const uncovered = uncoveredSteps(c, plan);
+    if (uncovered.length > 0) {
+      const list = uncovered.map((step) => `${step.step}. ${step.verb} (${step.protocol})`);
+      line(`gaps:     not covered by endpoints_verified_at — ${list.join(", ")}`);
+    }
     const cap = c.proof?.canary_max_amount ?? c.limits?.max_amount ?? "default";
     if (c.proof) {
       // A proof is on file but liveness() did not honour it (stale, future-dated):
@@ -277,16 +301,39 @@ export function formatPlan(c: Corridor, plan: Plan): string {
 }
 
 export type PlanArgs =
-  | { readonly ok: true; readonly file: string; readonly json: boolean }
+  | {
+      readonly ok: true;
+      readonly file: string;
+      readonly json: boolean;
+      /** `--registry`: also read the dest anchor's on-chain attestation. */
+      readonly registry: boolean;
+      /** Which registry deployment `--registry` reads (default testnet). */
+      readonly network: RegistryNetwork;
+    }
   | { readonly ok: false; readonly error: string };
 
-/** Parse `plan` arguments: one manifest path plus an optional `--json`. */
+const PLAN_USAGE =
+  "usage: corridor plan <file.corridor.yaml> [--json] [--registry [--network testnet|public]]";
+
+/** Parse `plan` arguments: one manifest path plus optional `--json` and `--registry`. */
 export function parsePlanArgs(args: readonly string[]): PlanArgs {
   let json = false;
+  let registry = false;
+  let network: RegistryNetwork | undefined;
   const files: string[] = [];
-  for (const arg of args) {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string;
     if (arg === "--json") {
       json = true;
+    } else if (arg === "--registry") {
+      registry = true;
+    } else if (arg === "--network") {
+      const value = args[i + 1];
+      if (value !== "testnet" && value !== "public") {
+        return { ok: false, error: "error: --network must be testnet or public" };
+      }
+      network = value;
+      i++;
     } else if (arg.startsWith("--")) {
       return { ok: false, error: `error: unknown option "${arg}"` };
     } else {
@@ -295,10 +342,14 @@ export function parsePlanArgs(args: readonly string[]): PlanArgs {
   }
   const [file] = files;
   if (!file) {
-    return { ok: false, error: "usage: corridor plan <file.corridor.yaml> [--json]" };
+    return { ok: false, error: PLAN_USAGE };
   }
   if (files.length > 1) {
     return { ok: false, error: `error: unexpected argument "${files[1]}"` };
   }
-  return { ok: true, file, json };
+  // A --network that nothing reads would look like it had been honoured.
+  if (network !== undefined && !registry) {
+    return { ok: false, error: "error: --network only applies with --registry" };
+  }
+  return { ok: true, file, json, registry, network: network ?? "testnet" };
 }

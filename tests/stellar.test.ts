@@ -22,6 +22,7 @@ import {
   verifySettlementFacts,
   LocalKeypairSigner,
   StellarClaimableBalanceStrategy,
+  StellarPathPaymentStrategy,
   StellarSep10Signer,
   StellarSettlementSubmitter,
   type AccountFacts,
@@ -29,7 +30,14 @@ import {
   type ExternalSigner,
   type SettlementFacts,
 } from "@corridor/stellar";
-import type { GateContext, RefundRequest, SettlementRequest } from "@corridor/engine";
+import {
+  StellarPaymentStrategy,
+  createMockSubmitter,
+  type GateContext,
+  type RefundRequest,
+  type SettlementRequest,
+} from "@corridor/engine";
+import type { OpenTransaction, Quote } from "@corridor/adapter-kit";
 import { parseCorridor, type Corridor } from "@corridor/manifest";
 import type { Horizon } from "@stellar/stellar-sdk";
 
@@ -415,6 +423,169 @@ describe("StellarSettlementSubmitter.fee", () => {
           fee: "not-a-number",
         }),
     ).toThrow(/invalid `fee`/);
+  });
+});
+
+describe("StellarSettlementSubmitter.submit — mainnet guard", () => {
+  // The guard belongs to the class that signs, not to the example launchers: an
+  // embedder who never runs `examples/run-testnet.ts` must still not be able to
+  // move real money because a manifest said `network: "public"`.
+  const onPublic = (): SettlementRequest => {
+    const base = testCorridor();
+    return {
+      ...testRequest(),
+      corridor: { ...base, settlement: { ...base.settlement, network: "public" } },
+    };
+  };
+  /** A KMS-shaped signer, so the local-key rule below is the only thing deciding. */
+  const kmsSigner = (): { signer: ExternalSigner } => {
+    const kp = Keypair.random();
+    return {
+      signer: { publicKey: kp.publicKey(), sign: async (data) => kp.sign(Buffer.from(data)) },
+    };
+  };
+  const refusingServer = () =>
+    fakeServer({
+      submitTransaction: async () => {
+        throw new Error("must not be reached");
+      },
+    });
+
+  it("refuses a public corridor by default, before loading the account", async () => {
+    const server = refusingServer();
+    const sub = new StellarSettlementSubmitter({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "unused",
+      horizonServer: server,
+    });
+
+    const r = await sub.submit(onPublic());
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("SETTLEMENT_FAILED");
+      // A policy refusal is final: the engine must not burn retries on it.
+      expect(r.error.retryable).toBe(false);
+      expect(r.error.message).toContain('refusing to settle on network "public"');
+    }
+    expect(server.loadAccount).not.toHaveBeenCalled();
+    expect(server.submitTransaction).not.toHaveBeenCalled();
+  });
+
+  it("settles a public corridor once the network is opted into", async () => {
+    const server = fakeServer({
+      submitTransaction: async () => ({ successful: true }),
+      lookupTransaction: async () => ({ successful: true, ledger_attr: 7 }),
+    });
+    const sub = new StellarSettlementSubmitter({
+      horizonUrl: "unused",
+      horizonServer: server,
+      allowedNetworks: ["public"],
+      ...kmsSigner(),
+    });
+
+    const r = await sub.submit(onPublic());
+    expect(r.ok).toBe(true);
+    if (r.ok && r.value.kind === "stellar") expect(r.value.ledger).toBe(7);
+    expect(server.loadAccount).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses to sign a public settlement with a local key, even when public is allowed", async () => {
+    const server = refusingServer();
+    const sub = new StellarSettlementSubmitter({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "unused",
+      horizonServer: server,
+      allowedNetworks: ["public"],
+    });
+
+    const r = await sub.submit(onPublic());
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("SETTLEMENT_FAILED");
+      expect(r.error.retryable).toBe(false);
+      expect(r.error.message).toContain("LocalKeypairSigner");
+    }
+    expect(server.loadAccount).not.toHaveBeenCalled();
+  });
+
+  it("accepts a local key on public only under an explicit allowLocalSignerOnMainnet", async () => {
+    const server = fakeServer({
+      submitTransaction: async () => ({ successful: true }),
+      lookupTransaction: async () => ({ successful: true, ledger_attr: 8 }),
+    });
+    const sub = new StellarSettlementSubmitter({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "unused",
+      horizonServer: server,
+      allowedNetworks: ["public"],
+      allowLocalSignerOnMainnet: true,
+    });
+
+    const r = await sub.submit(onPublic());
+    expect(r.ok).toBe(true);
+  });
+
+  it("refuses when the Horizon endpoint serves a different network than the corridor", async () => {
+    const server = refusingServer();
+    const root = vi.fn(async () => ({ network_passphrase: Networks.PUBLIC }));
+    const sub = new StellarSettlementSubmitter({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "https://horizon-testnet.stellar.org",
+      horizonServer: server,
+      fetchHorizonRoot: root,
+    });
+
+    // testCorridor() is testnet; the endpoint claims to be mainnet.
+    const r = await sub.submit(testRequest());
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("SETTLEMENT_FAILED");
+      expect(r.error.retryable).toBe(false);
+      expect(r.error.message).toContain(Networks.PUBLIC);
+      expect(r.error.message).toContain(Networks.TESTNET);
+    }
+    expect(server.loadAccount).not.toHaveBeenCalled();
+    // The root resource is read once and memoised, not re-fetched per payment.
+    await sub.submit(testRequest());
+    expect(root).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails retryably when the endpoint network cannot be verified", async () => {
+    const server = refusingServer();
+    const sub = new StellarSettlementSubmitter({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "https://horizon-testnet.stellar.org",
+      horizonServer: server,
+      fetchHorizonRoot: async () => {
+        throw new Error("ECONNREFUSED");
+      },
+    });
+
+    const r = await sub.submit(testRequest());
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("SETTLEMENT_FAILED");
+      // Nothing was built, signed or submitted, so trying again is safe.
+      expect(r.error.retryable).toBe(true);
+      expect(r.error.message).toContain("cannot verify the network");
+    }
+    expect(server.loadAccount).not.toHaveBeenCalled();
+  });
+
+  it("settles a testnet corridor whose endpoint declares the testnet passphrase", async () => {
+    const server = fakeServer({
+      submitTransaction: async () => ({ successful: true }),
+      lookupTransaction: async () => ({ successful: true, ledger_attr: 9 }),
+    });
+    const sub = new StellarSettlementSubmitter({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "https://horizon-testnet.stellar.org",
+      horizonServer: server,
+      fetchHorizonRoot: async () => ({ network_passphrase: Networks.TESTNET }),
+    });
+
+    const r = await sub.submit(testRequest());
+    expect(r.ok).toBe(true);
   });
 });
 
@@ -1886,5 +2057,250 @@ describe("settlement on-chain verification", () => {
       req({ to: Keypair.random().publicKey() }),
     );
     expect(bad.ok).toBe(false);
+  });
+});
+
+// --- StellarPathPaymentStrategy (#217) -----------------------------------
+// The anchor receives a different asset than the bridge asset we hold, so the
+// settle leg is one path_payment_strict_send: the best Horizon strict-send
+// path, destMin = expected × (1 - max_slippage_bps), and nothing submitted when
+// there is no path or destMin undercuts what the anchor said it needs.
+
+describe("StellarPathPaymentStrategy", () => {
+  const RECV_ISSUER = Keypair.random().publicKey();
+  const MID_ISSUER = Keypair.random().publicKey();
+  const DEST = Keypair.random().publicKey();
+
+  function pathCorridor(settlement: Record<string, unknown> = {}): Corridor {
+    const base = testCorridor();
+    const r = parseCorridor({
+      ...base,
+      settlement: {
+        ...base.settlement,
+        receive_asset: "ARSX",
+        receive_asset_issuer: RECV_ISSUER,
+        ...settlement,
+      },
+    });
+    if (!r.ok) throw new Error(`fixture invalid: ${JSON.stringify(r.error)}`);
+    return r.value;
+  }
+
+  type PathRecord = {
+    destination_amount: string;
+    path: Array<{ asset_type: string; asset_code?: string; asset_issuer?: string }>;
+  };
+
+  /** Fake Horizon: strict-send paths plus the submit()/confirm surface. */
+  function fakePathServer(records: PathRecord[] | Error) {
+    const submitted: Transaction[] = [];
+    const strictSendPaths = vi.fn(() => ({
+      call: async () => {
+        if (records instanceof Error) throw records;
+        return { records };
+      },
+    }));
+    const loadAccount = vi.fn(async (publicKey: string) => new Account(publicKey, "100"));
+    const submitTransaction = vi.fn(async (tx: Transaction) => {
+      submitted.push(tx);
+      return { successful: true };
+    });
+    const server = {
+      loadAccount,
+      submitTransaction,
+      strictSendPaths,
+      transactions: () => ({
+        transaction: () => ({ call: async () => ({ successful: true, ledger_attr: 9 }) }),
+      }),
+    } as unknown as Horizon.Server;
+    return { server, strictSendPaths, loadAccount, submitTransaction, submitted };
+  }
+
+  function strategyFor(server: Horizon.Server) {
+    return new StellarPathPaymentStrategy(
+      new StellarSettlementSubmitter({
+        signerSecret: Keypair.random().secret(),
+        horizonUrl: "unused",
+        horizonServer: server,
+      }),
+    );
+  }
+
+  function ctx(corridor: Corridor, amountIn?: OpenTransaction["amountIn"]) {
+    const opened: OpenTransaction = {
+      transactionId: "tx_1",
+      instructions: { kind: "stellar_payment", to: DEST, memo: "memo-xyz", memoType: "text" },
+      ...(amountIn && { amountIn }),
+    };
+    const quote: Quote = {
+      id: "q_1",
+      price: "1",
+      expiresAt: Date.now() + 60_000,
+      sourceAmount: { asset: "USDC", amount: "10" },
+      destAmount: { asset: "iso4217:ARS", amount: "10" },
+      firm: true,
+    };
+    return { opened, quote, corridor };
+  }
+
+  it("builds pathPaymentStrictSend from the best path with destMin = expected less slippage", async () => {
+    const fake = fakePathServer([
+      { destination_amount: "98.1000000", path: [] },
+      {
+        destination_amount: "100.0000000",
+        path: [
+          { asset_type: "credit_alphanum4", asset_code: "MID", asset_issuer: MID_ISSUER },
+        ],
+      },
+    ]);
+    const res = await strategyFor(fake.server).settle(ctx(pathCorridor()));
+    expect(res.ok).toBe(true);
+
+    // Queried for exactly what we send, toward exactly what the anchor receives.
+    const [sendAsset, sendAmount, dest] = fake.strictSendPaths.mock.calls[0] as unknown as [
+      Asset,
+      string,
+      Asset[],
+    ];
+    expect(sendAsset.equals(new Asset("USDC", ISSUER))).toBe(true);
+    expect(sendAmount).toBe("10");
+    expect(dest).toHaveLength(1);
+    expect(dest[0]!.equals(new Asset("ARSX", RECV_ISSUER))).toBe(true);
+
+    expect(fake.submitted).toHaveLength(1);
+    const tx = fake.submitted[0]!;
+    expect(tx.operations).toHaveLength(1);
+    const op = tx.operations[0]!;
+    expect(op.type).toBe("pathPaymentStrictSend");
+    if (op.type !== "pathPaymentStrictSend") return;
+    expect(op.destination).toBe(DEST);
+    expect(op.sendAsset.equals(new Asset("USDC", ISSUER))).toBe(true);
+    expect(op.sendAmount).toBe("10.0000000");
+    expect(op.destAsset.equals(new Asset("ARSX", RECV_ISSUER))).toBe(true);
+    // Best path (100), default 50 bps: 100 × 0.995 = 99.5.
+    expect(op.destMin).toBe("99.5000000");
+    expect(op.path).toHaveLength(1);
+    expect(op.path[0]!.equals(new Asset("MID", MID_ISSUER))).toBe(true);
+    expect(tx.memo.type).toBe("text");
+    expect(Buffer.from(tx.memo.value as Uint8Array).toString()).toBe("memo-xyz");
+  });
+
+  it("applies the manifest's max_slippage_bps and rounds destMin up to the stroop", async () => {
+    const fake = fakePathServer([{ destination_amount: "1.0000001", path: [] }]);
+    const res = await strategyFor(fake.server).settle(
+      ctx(pathCorridor({ max_slippage_bps: 125 })),
+    );
+    expect(res.ok).toBe(true);
+    const op = fake.submitted[0]!.operations[0]!;
+    // 1.0000001 × 0.9875 = 0.98750009875 → never below the bound: 0.9875001.
+    if (op.type === "pathPaymentStrictSend") expect(op.destMin).toBe("0.9875001");
+    else expect.fail(`expected pathPaymentStrictSend, got ${op.type}`);
+  });
+
+  it("no path: fails closed without loading the account or submitting", async () => {
+    const fake = fakePathServer([]);
+    const res = await strategyFor(fake.server).settle(ctx(pathCorridor()));
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error.code).toBe("SETTLEMENT_FAILED");
+      expect(res.error.retryable).toBe(false);
+      expect(res.error.message).toContain("no strict-send path");
+    }
+    expect(fake.loadAccount).not.toHaveBeenCalled();
+    expect(fake.submitTransaction).not.toHaveBeenCalled();
+  });
+
+  it("a failed path query is retryable and submits nothing", async () => {
+    const fake = fakePathServer(new Error("ECONNRESET"));
+    const res = await strategyFor(fake.server).settle(ctx(pathCorridor()));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error.retryable).toBe(true);
+    expect(fake.submitTransaction).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when destMin is below the receive amount the anchor requires", async () => {
+    const fake = fakePathServer([{ destination_amount: "100", path: [] }]);
+    // The anchor expects 99.9 ARSX in; destMin at 50 bps is only 99.5.
+    const res = await strategyFor(fake.server).settle(
+      ctx(pathCorridor(), { asset: `stellar:ARSX:${RECV_ISSUER}`, amount: "99.9" }),
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error.code).toBe("SETTLEMENT_FAILED");
+      expect(res.error.retryable).toBe(false);
+      expect(res.error.message).toContain("below");
+    }
+    expect(fake.submitTransaction).not.toHaveBeenCalled();
+
+    // At or under destMin, the same requirement lets the payment through.
+    const okFake = fakePathServer([{ destination_amount: "100", path: [] }]);
+    const passed = await strategyFor(okFake.server).settle(
+      ctx(pathCorridor(), { asset: `stellar:ARSX:${RECV_ISSUER}`, amount: "99.5" }),
+    );
+    expect(passed.ok).toBe(true);
+  });
+
+  it("claims only corridors whose receive_asset differs from the bridge asset", () => {
+    const strat = strategyFor(fakePathServer([]).server);
+    const plain = new StellarPaymentStrategy(createMockSubmitter());
+    const path = ctx(pathCorridor());
+    const same = ctx(pathCorridor({ receive_asset: "USDC", receive_asset_issuer: ISSUER }));
+    const none = ctx(testCorridor());
+    expect(strat.matches(path)).toBe(true);
+    expect(plain.matches(path)).toBe(false);
+    expect(strat.matches(same)).toBe(false);
+    expect(plain.matches(same)).toBe(true);
+    expect(strat.matches(none)).toBe(false);
+    expect(plain.matches(none)).toBe(true);
+  });
+
+  it("submit() refuses a plain payment on a path corridor", async () => {
+    const fake = fakePathServer([]);
+    const sub = new StellarSettlementSubmitter({
+      signerSecret: Keypair.random().secret(),
+      horizonUrl: "unused",
+      horizonServer: fake.server,
+    });
+    const res = await sub.submit({ ...testRequest(), corridor: pathCorridor() });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error.retryable).toBe(false);
+    expect(fake.submitTransaction).not.toHaveBeenCalled();
+  });
+
+  it("the chain verifier checks a path payment's source and receive legs", () => {
+    const req: SettlementRequest = {
+      to: DEST,
+      amount: { asset: "USDC", amount: "10" },
+      corridor: pathCorridor(),
+      memo: "abc",
+      memoType: "text",
+    };
+    const facts = (op: Record<string, unknown> = {}) =>
+      ({
+        hash: "h",
+        successful: true,
+        memo: "abc",
+        memoType: "text",
+        operations: [
+          {
+            type: "path_payment_strict_send",
+            to: DEST,
+            amount: "99.6000000",
+            asset_type: "credit_alphanum4",
+            asset_code: "ARSX",
+            asset_issuer: RECV_ISSUER,
+            source_amount: "10.0000000",
+            source_asset_type: "credit_alphanum4",
+            source_asset_code: "USDC",
+            source_asset_issuer: ISSUER,
+            ...op,
+          },
+        ],
+      }) as SettlementFacts;
+    expect(verifySettlementFacts(facts(), req).ok).toBe(true);
+    expect(verifySettlementFacts(facts({ type: "payment" }), req).ok).toBe(false);
+    expect(verifySettlementFacts(facts({ source_amount: "11" }), req).ok).toBe(false);
+    expect(verifySettlementFacts(facts({ asset_code: "USDC" }), req).ok).toBe(false);
+    expect(verifySettlementFacts(facts({ source_asset_code: "EURC" }), req).ok).toBe(false);
   });
 });

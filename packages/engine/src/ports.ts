@@ -158,7 +158,26 @@ export interface SettlementStrategy {
   /** Must match `DepositInstructionsKind`. The engine picks the first strategy
    *  whose `kind` equals the deposit instructions kind on the opened tx. */
   readonly kind: DepositInstructionsKind;
+  /** Optional second filter after `kind`: return false to leave this settlement
+   *  to another strategy of the same kind (e.g. a plain payment declining a
+   *  corridor whose anchor receives a different asset). Omitted = accept all. */
+  matches?(ctx: SettlementStrategyContext): boolean;
   settle(ctx: SettlementStrategyContext): Promise<Outcome<SettlementRef>>;
+}
+
+/**
+ * True when the corridor's anchor receives a different on-chain asset than the
+ * bridge asset we hold (`settlement.receive_asset`), so a plain payment would
+ * deliver the wrong asset and the settle leg must path-pay through the DEX.
+ */
+export function needsPathPayment(corridor: Corridor): boolean {
+  const { bridge_asset, asset_issuer, receive_asset, receive_asset_issuer } =
+    corridor.settlement;
+  if (receive_asset === undefined) return false;
+  const bridgeIsXlm = bridge_asset.toUpperCase() === "XLM";
+  const receiveIsXlm = receive_asset.toUpperCase() === "XLM";
+  if (bridgeIsXlm || receiveIsXlm) return bridgeIsXlm !== receiveIsXlm;
+  return receive_asset !== bridge_asset || receive_asset_issuer !== asset_issuer;
 }
 
 /**
@@ -173,6 +192,12 @@ export class StellarPaymentStrategy implements SettlementStrategy {
   readonly kind: DepositInstructionsKind = "stellar_payment";
 
   constructor(private readonly submitter: SettlementSubmitter) {}
+
+  /** A plain payment delivers the bridge asset, so it declines a corridor whose
+   *  anchor receives something else — that is a path payment's job. */
+  matches({ corridor }: SettlementStrategyContext): boolean {
+    return !needsPathPayment(corridor);
+  }
 
   async settle({
     opened,

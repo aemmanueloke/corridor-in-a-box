@@ -4,14 +4,15 @@
 // breakers.
 //
 //   corridor validate <file.corridor.yaml>
-//   corridor plan     <file.corridor.yaml>
+//   corridor plan     <file.corridor.yaml> [--json] [--registry [--network <testnet|public>]]
 //   corridor canary   <file.corridor.yaml> --amount <amount> [--network <public|testnet>] [--dry-run]
 //   corridor breaker  status [corridorId]
 //   corridor breaker  reset <corridorId> --reason "…"
 //
 // `plan` is the cheap pre-flight: it tells you whether a corridor is actually
 // runnable (does the dest anchor expose SEP-31? a SEP-38 quote server?) before
-// you ever touch the network.
+// you ever touch the network. `--registry` opts in to one network read: the dest
+// anchor's on-chain attestation, printed beside the manifest's own claim.
 //
 // `canary` drives one tiny real payment through the full, gated stack:
 // Sep31Adapter + StellarSettlementSubmitter + the default gate + RegistryRouteResolver.
@@ -21,7 +22,7 @@
 // at why and then say so in writing before it will take money again. See
 // docs/operations.md.
 
-import { loadCorridor } from "@corridor/manifest";
+import { loadCorridor, type Corridor } from "@corridor/manifest";
 import { isSettleableAmount } from "@corridor/types";
 import { PostgresIdempotencyStore, migrate, type CorridorHealthStore } from "@corridor/engine";
 import { newCommand } from "./new.js";
@@ -46,12 +47,17 @@ import {
   type BreakerCommand,
 } from "./breaker";
 import { formatLintResult, lintCorridor } from "./lint";
-import { buildPlan, formatPlan, parsePlanArgs } from "./plan.js";
+import { buildPlan, formatPlan, parsePlanArgs, type Plan, type PlanArgs } from "./plan.js";
+import {
+  formatRegistryCheck,
+  runRegistryCheck,
+  type RegistryNetwork,
+} from "./plan-registry.js";
 
 /** The first line is the main usage text; the breaker help follows it. */
 const USAGE = [
   "usage: corridor <validate|plan|lint|canary|new> <file.corridor.yaml|domain> [options] | runs list --state held | resolve <key> --outcome <outcome> --note <text>",
-  "       corridor plan <file.corridor.yaml> [--json]",
+  "       corridor plan <file.corridor.yaml> [--json] [--registry [--network testnet|public]]",
   '       corridor breaker <status [corridorId] | reset <corridorId> --reason "…">',
   "       corridor new <domain> [--source-asset <asset>] [--network <public|testnet>] [--out <file>] [--allow-not-runnable]",
   "",
@@ -68,7 +74,7 @@ async function main(argv: string[]): Promise<number> {
   const [cmd] = argv;
   if (cmd === "runs") {
     const parsed = parseListArgs(argv.slice(1));
-    return parsed ? withNStore((store) => listHeldRuns(store, parsed)) : 2;
+    return parsed ? withStore((store) => listHeldRuns(store, parsed)) : 2;
   }
   if (cmd === "resolve") return resolveCommand(argv.slice(1));
   if (cmd === "breaker") return breakerCommand(argv.slice(1));
@@ -118,8 +124,7 @@ async function main(argv: string[]): Promise<number> {
         if (!file) {
           file = arg;
         } else {
-          console.error(`error: unexpected argument "${
-            arg}"`);
+          console.error(`error: unexpected argument "${arg}"`);
           return 2;
         }
       }
@@ -192,6 +197,7 @@ async function main(argv: string[]): Promise<number> {
 
   let file = argv[1];
   let json = false;
+  let planArgs: Extract<PlanArgs, { ok: true }> | undefined;
   if (cmd === "plan") {
     const parsed = parsePlanArgs(argv.slice(1));
     if (!parsed.ok) {
@@ -200,6 +206,7 @@ async function main(argv: string[]): Promise<number> {
     }
     file = parsed.file;
     json = parsed.json;
+    planArgs = parsed;
   }
   if (!file) {
     console.error(`usage: corridor ${cmd} <file.corridor.yaml>`);
@@ -237,7 +244,31 @@ async function main(argv: string[]): Promise<number> {
   }
 
   const plan = buildPlan(c);
+  if (planArgs?.registry) return planWithRegistry(c, plan, planArgs.network, json);
   console.log(json ? JSON.stringify(plan, null, 2) : formatPlan(c, plan));
+  return EXIT_OK;
+}
+
+/**
+ * `plan --registry`: the offline plan, then the registry's view of the dest
+ * anchor. Informational only, so a failed read is a warning on stderr and the
+ * exit code stays whatever the offline plan would have returned.
+ */
+async function planWithRegistry(
+  c: Corridor,
+  plan: Plan,
+  network: RegistryNetwork,
+  json: boolean,
+): Promise<number> {
+  if (!json) console.log(formatPlan(c, plan));
+  const result = await runRegistryCheck(c, network);
+  if (!result.ok) console.error(`! ${result.warning}`);
+  if (json) {
+    const out = result.ok ? { ...plan, registry: result.check } : plan;
+    console.log(JSON.stringify(out, null, 2));
+  } else if (result.ok) {
+    console.log(`\n${formatRegistryCheck(result.check)}`);
+  }
   return EXIT_OK;
 }
 
@@ -321,7 +352,7 @@ async function resolveCommand(args: string[]): Promise<number> {
   return withStore((store) => resolveHeldRun(store, parsed, resolvedBy));
 }
 
-async function withNStore(
+async function withStore(
   fn: (store: PostgresIdempotencyStore) => Promise<number>,
 ): Promise<number> {
   const opened = await openStore();
