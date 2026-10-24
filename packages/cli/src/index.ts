@@ -23,7 +23,7 @@
 
 import { loadCorridor } from "@corridor/manifest";
 import { isSettleableAmount } from "@corridor/types";
-import { PostgresSqlIdempotencyStore, migrate, type CorridorHealthStore } from "@corridor/engine";
+import { PostgresIdempotencyStore, migrate, type CorridorHealthStore } from "@corridor/engine";
 import { newCommand } from "./new.js";
 import {
   RESOLVE_USAGE,
