@@ -180,10 +180,35 @@ export const FxSchema = z
     }
   });
 
+/**
+ * How a corridor's receiving-side KYC is performed. The same vocabulary as
+ * `AdapterCapabilities.kyc`, so a manifest and an adapter cannot drift apart.
+ *  - `sep12`:       the receiver is registered via SEP-12 and its status read
+ *                   with `GET /customer` against the dest's `kyc_server`.
+ *  - `sep6_fields`: KYC travels inline on the SEP-6 request. The engine carries
+ *                   field NAMES and operator-supplied references, never raw PII.
+ *  - `bespoke`:     anchor-specific onboarding; the engine only carries the
+ *                   anchor's customer reference (`PartyRef.anchorCustomerId`).
+ *  - `none`:        no per-customer KYC at the receiver.
+ */
+export const COMPLIANCE_METHODS = ["sep12", "sep6_fields", "bespoke", "none"] as const;
+export type ComplianceMethod = (typeof COMPLIANCE_METHODS)[number];
+
 export const ComplianceSchema = z.object({
   source_jurisdiction: z.string().min(1),
   dest_jurisdiction: z.string().min(1),
   travel_rule_profile: z.string().default("default"),
+  /**
+   * How the receiver's KYC is done (#193). Optional, and deliberately NOT
+   * filled in at parse time: a parse-time default would change `hashCorridor`
+   * for every existing manifest and refuse to resume their in-flight runs.
+   * Read it through `complianceMethod()`, which derives the default — `sep12`
+   * when the dest has a `kyc_server`, else `none`.
+   *
+   * An explicit value is a claim the engine checks against the adapter's
+   * `capabilities().kyc` before any money moves; a mismatch fails closed.
+   */
+  method: z.enum(COMPLIANCE_METHODS).optional(),
   /**
    * SEP-12 customer `type` for the receiving party.
    *
@@ -199,13 +224,50 @@ export const ComplianceSchema = z.object({
   sep12_sender_type: z.string().default("sep31-sender"),
 });
 
-export const SettlementSchema = z.object({
-  /** The on-chain bridge asset moved between the two anchors. */
-  bridge_asset: z.string().default("USDC"),
-  network: z.enum(["public", "testnet"]),
-  /** Issuer account of the bridge asset on the chosen network. */
-  asset_issuer: z.string().min(1),
-});
+export const SettlementSchema = z
+  .object({
+    /** The on-chain bridge asset moved between the two anchors. */
+    bridge_asset: z.string().default("USDC"),
+    network: z.enum(["public", "testnet"]),
+    /** Issuer account of the bridge asset on the chosen network. */
+    asset_issuer: z.string().min(1),
+    /**
+     * Asset code the receiving anchor accepts on-chain, when it is not the bridge
+     * asset. Set it and the settle leg becomes a `path_payment_strict_send`
+     * through the DEX: `bridge_asset` goes out, `receive_asset` arrives. Omit to
+     * pay `bridge_asset` directly.
+     */
+    receive_asset: z.string().min(1).optional(),
+    /** Issuer account of `receive_asset`. Required unless `receive_asset` is XLM. */
+    receive_asset_issuer: z.string().min(1).optional(),
+    /**
+     * Worst price move tolerated on a path payment, in basis points: the payment
+     * fails on-chain rather than deliver less than `expected × (1 - bps/10000)`.
+     * Omit for the conservative default of 50 (0.5%). Optional rather than
+     * defaulted so manifests that never path-pay keep their existing hash.
+     */
+    max_slippage_bps: z.number().int().min(0).lt(10_000).optional(),
+  })
+  .superRefine((s, ctx) => {
+    if (s.receive_asset_issuer !== undefined && s.receive_asset === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["receive_asset"],
+        message: "receive_asset_issuer is set but receive_asset is not",
+      });
+    }
+    if (
+      s.receive_asset !== undefined &&
+      s.receive_asset.toUpperCase() !== "XLM" &&
+      s.receive_asset_issuer === undefined
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["receive_asset_issuer"],
+        message: `receive_asset_issuer is required for receive_asset "${s.receive_asset}"`,
+      });
+    }
+  });
 
 /** Per-corridor payment limits (floor and ceiling). Optional, but a lane with no ceiling accepts
  *  any positive amount the caller asks for — set one before real money. */
@@ -315,19 +377,56 @@ export const ProofSchema = z.object({
     .optional(),
 });
 
-export const CorridorSchema = z.object({
-  id: z.string().min(1),
-  /** Human note. Use it to record liveness, e.g. "pending: no RMB SEP-31 anchor". */
-  status_note: z.string().optional(),
-  source: SourceAnchorSchema,
-  dest: DestSchema,
-  fx: FxSchema,
-  compliance: ComplianceSchema,
-  settlement: SettlementSchema,
-  recovery: RecoverySchema,
-  limits: LimitsSchema.optional(),
-  proof: ProofSchema.optional(),
-});
+export const CorridorSchema = z
+  .object({
+    id: z.string().min(1),
+    /** Human note. Use it to record liveness, e.g. "pending: no RMB SEP-31 anchor". */
+    status_note: z.string().optional(),
+    source: SourceAnchorSchema,
+    dest: DestSchema,
+    fx: FxSchema,
+    compliance: ComplianceSchema,
+    settlement: SettlementSchema,
+    recovery: RecoverySchema,
+    limits: LimitsSchema.optional(),
+    proof: ProofSchema.optional(),
+  })
+  .superRefine((c, ctx) => {
+    // `compliance.method` needs dest context ComplianceSchema cannot see. Refuse
+    // the combinations that could never run rather than let them fail later.
+    const method = c.compliance.method;
+    if (method === "sep12" && !hasKycServer(c.dest)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["compliance", "method"],
+        message: 'compliance.method "sep12" requires dest.endpoints.kyc_server',
+      });
+    }
+    if (method === "sep6_fields" && c.dest.protocol !== "sep6") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["compliance", "method"],
+        message: `compliance.method "sep6_fields" requires dest.protocol "sep6", got "${c.dest.protocol}"`,
+      });
+    }
+  });
+
+function hasKycServer(dest: z.infer<typeof DestSchema>): boolean {
+  return "kyc_server" in dest.endpoints && Boolean(dest.endpoints.kyc_server);
+}
+
+/**
+ * The corridor's compliance method: the explicit `compliance.method` when set,
+ * otherwise `sep12` when the dest exposes a `kyc_server` and `none` when it
+ * does not — the same answer `Sep31Adapter.capabilities().kyc` gives.
+ *
+ * The adapter stays authoritative for what it actually enforces: a derived
+ * `none` never switches off a check an adapter performs (the SEP-6 adapter,
+ * for one, still refuses a dest with no `kyc_server`).
+ */
+export function complianceMethod(corridor: Corridor): ComplianceMethod {
+  return corridor.compliance.method ?? (hasKycServer(corridor.dest) ? "sep12" : "none");
+}
 
 export type Corridor = z.infer<typeof CorridorSchema>;
 export type DestProtocol = "sep31" | "sep6" | `custom:${string}`;
